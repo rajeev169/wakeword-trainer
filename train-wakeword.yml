@@ -1,0 +1,100 @@
+name: Train Shivangi wake word
+
+on:
+  workflow_dispatch:
+    inputs:
+      samples:
+        description: "Positive clips from the English multi-speaker voice (more = better, slower)"
+        default: "2400"
+      epochs:
+        description: "Training rounds"
+        default: "40"
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+          pip install "piper-sample-generator @ git+https://github.com/rhasspy/piper-sample-generator" onnxruntime onnx soundfile scipy numpy
+
+      - name: Download voices
+        run: |
+          mkdir -p voices
+          # English generator with ~900 different speakers (MIT)
+          wget -q -O voices/libritts.pt https://github.com/rhasspy/piper-sample-generator/releases/download/v2.0.0/en_US-libritts_r-medium.pt
+          # Hindi Piper voices (skipped if a name is not available)
+          HF=https://huggingface.co/rhasspy/piper-voices/resolve/main/hi/hi_IN
+          for v in pratham priyamvada rohan; do
+            wget -q -O voices/hi_IN-$v-medium.onnx $HF/$v/medium/hi_IN-$v-medium.onnx \
+              && wget -q -O voices/hi_IN-$v-medium.onnx.json $HF/$v/medium/hi_IN-$v-medium.onnx.json \
+              || rm -f voices/hi_IN-$v-medium.onnx*
+          done
+          ls -la voices
+
+      - name: Generate "Shivangi" (English voices)
+        run: |
+          N=$(( ${{ github.event.inputs.samples }} / 6 ))
+          for t in "Shivangi" "Shivangi!" "Shivangi?" "Shivaangee" "Shi vaan gee" "Hey Shivangi"; do
+            python -m piper_sample_generator "$t" --model voices/libritts.pt --max-samples $N --batch-size 20 \
+              --output-dir "data/positive/en_$(echo $t | tr -cd 'a-zA-Z')" || echo "skipped $t"
+          done
+
+      - name: Generate "शिवांगी" (Hindi voices)
+        run: |
+          HI=$(ls voices/*.onnx 2>/dev/null | sed 's/^/--model /' | tr '\n' ' ')
+          if [ -n "$HI" ]; then
+            for t in "शिवांगी" "शिवांगी!" "शिवांगी?" "हे शिवांगी"; do
+              python -m piper_sample_generator "$t" $HI --max-samples 150 --output-dir "data/positive/hi_$RANDOM" || echo "skipped"
+            done
+          fi
+
+      - name: Generate similar words (must NOT wake her)
+        run: |
+          while read -r t; do
+            [ -z "$t" ] && continue
+            python -m piper_sample_generator "$t" --model voices/libritts.pt --max-samples 40 --batch-size 20 \
+              --output-dir "data/adversarial/en_$RANDOM" || true
+          done < adversarial_en.txt
+          HI=$(ls voices/*.onnx 2>/dev/null | sed 's/^/--model /' | tr '\n' ' ')
+          if [ -n "$HI" ]; then
+            while read -r t; do
+              [ -z "$t" ] && continue
+              python -m piper_sample_generator "$t" $HI --max-samples 24 --output-dir "data/adversarial/hi_$RANDOM" || true
+            done < adversarial_hi.txt
+          fi
+
+      - name: Generate everyday speech (must NOT wake her)
+        run: |
+          while read -r t; do
+            [ -z "$t" ] && continue
+            python -m piper_sample_generator "$t" --model voices/libritts.pt --max-samples 20 --batch-size 20 \
+              --output-dir "data/negative/en_$RANDOM" || true
+          done < phrases_en.txt
+          HI=$(ls voices/*.onnx 2>/dev/null | sed 's/^/--model /' | tr '\n' ' ')
+          if [ -n "$HI" ]; then
+            while read -r t; do
+              [ -z "$t" ] && continue
+              python -m piper_sample_generator "$t" $HI --max-samples 9 --output-dir "data/negative/hi_$RANDOM" || true
+            done < phrases_hi.txt
+          fi
+
+      - name: Train
+        run: |
+          python train.py --pos data/positive --adv data/adversarial --neg data/negative \
+            --out output --epochs ${{ github.event.inputs.epochs }}
+          cat output/report.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shivangi-wakeword
+          path: output/
